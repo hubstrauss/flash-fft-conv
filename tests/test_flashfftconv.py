@@ -1,49 +1,7 @@
 import torch
 from flashfftconv import FlashFFTConv
+from utils import *
 import pytest
-
-def ref_fft_conv(u, k, n=None):
-    if n is None:
-        n = u.size(-1)
-    l = u.size(-1)
-    u_f = torch.fft.fft(u.to(torch.float32), n=n)
-    k_f = torch.fft.fft(k.to(torch.float32), n=n)
-    u_f = u_f * k_f
-    out = torch.fft.ifft(u_f, n=n)
-    return out.real.to(u.dtype)[..., :l]
-
-def set_B_H(B, H, seqlen):
-    if seqlen == 16384 and B > 32:
-        B = 32
-    if seqlen == 32768 and B > 16:
-        B = 16
-    if seqlen == 65536 and B > 4:
-        B = 4
-    if seqlen == 131072 and B > 4:
-        B = 4
-    if seqlen == 131072 and H > 384:
-        H = 384
-    if seqlen == 262144 and B > 4:
-        B = 4
-    if seqlen == 262144 and H > 192:
-        H = 192
-    if seqlen == 524288 and B > 4:
-        B = 4
-    if seqlen == 524288 and H > 96:
-        H = 96
-    if seqlen == 1048576 and B > 4:
-        B = 4
-    if seqlen == 1048576 and H > 48:
-        H = 48
-    if seqlen == 2097152 and B > 4:
-        B = 4
-    if seqlen == 2097152 and H > 32:
-        H = 32
-    if seqlen == 4194304 and B > 4:
-        B = 4
-    if seqlen == 4194304 and H > 16:
-        H = 16
-    return B, H
 
 @pytest.mark.parametrize('B', [1, 2, 4, 8, 64])
 @pytest.mark.parametrize('H', [768, 111])

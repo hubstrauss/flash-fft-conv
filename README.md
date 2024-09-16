@@ -60,6 +60,10 @@ cd ../..
 python setup.py install
 ```
 
+N.B:
+* You may have some memory limitations on your computer. If you see the repeated killed message, your system is maybe running out of memory. Try reducing the number of jobs used for compilation by setting the ```MAX_JOBS``` environment variable. 
+* If you don't need the ninja build system, try forcing the build to use the default make using the environment variable ```USE_NINJA```.
+
 Once it's installed, you should be able to run the test suite:
 ```
 pytest -s -q tests/test_flashfftconv.py

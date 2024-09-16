@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
+from flashfftconv.utils import *
+from flashfftconv.strategies import *
 from monarch_cuda import monarch_conv_forward, monarch_conv_backward, \
     monarch_conv_forward_r2r, monarch_conv_backward_r2r, \
     monarch_conv_forward_16_16_16, monarch_conv_backward_16_16_16, \
@@ -21,55 +23,6 @@ from monarch_cuda import butterfly_bf16_forward, butterfly_ifft_bf16_forward, bu
 
 torch.manual_seed(23)
 
-def fft_matrix(N):
-    n = torch.arange(N)
-    k = n.view(-1, 1)
-    M = torch.exp(-2j * torch.pi * n * k / N)
-    return M
-
-def compute_twiddle_factors_fft(n, m):
-    """Compute the twiddle factors of size n x m"""
-    # n_a = torch.arange(n).view(-1, 1)
-    # m_a = torch.arange(m)
-    n_a = torch.arange(n).view(-1, 1)
-    m_a = torch.arange(m)
-    N = n * m
-    M = torch.exp(-2j * torch.pi * n_a * m_a / N)
-    return M
-
-def ifft_matrix(N):
-    n = torch.arange(N)
-    k = n.view(-1, 1)
-    M = torch.exp(2j * torch.pi * n * k / N)
-    return M
-
-def compute_twiddle_factors_ifft(n, m):
-    """Compute the twiddle factors of size n x m"""
-    # n_a = torch.arange(n).view(-1, 1)
-    # m_a = torch.arange(m)
-    n_a = torch.arange(n).view(-1, 1)
-    m_a = torch.arange(m)
-    N = n * m
-    M = torch.exp(2j * torch.pi * n_a * m_a / N)
-    return M
-
-def monarch_outer_dft(x, f_sqrt_N_fft, twiddle_factors_fft, sqrt_N):
-    x = x.transpose(-1, -2) # 32K, 32
-    x = x @ f_sqrt_N_fft    # 32K, 32
-    x = x.transpose(-1, -2) # 32, 32K
-    # x = (f_sqrt_N_fft.T @ x) * twiddle_factors_fft # (32, 32K) * (32, 32K), pointwise
-
-    return (x * twiddle_factors_fft).contiguous()
-
-def monarch_outer_idft(x, f_sqrt_N_ifft, twiddle_factors_ifft, sqrt_N):
-    # x = f_sqrt_N_ifft.T @ (x * twiddle_factors_ifft) # (32, 32K) * (32, 32K), pointwise
-    x = x * twiddle_factors_ifft 
-    x = x.transpose(-1, -2) # 32K, 32
-    x = x @ f_sqrt_N_ifft
-    x = x.transpose(-1, -2) # 32, 32K
-
-    return x.contiguous()
-
 class FlashFFTConv(torch.nn.Module):
     def __init__(self, seqlen, dtype=torch.float16, use_32_butterfly=True):
         super().__init__()
@@ -77,496 +30,34 @@ class FlashFFTConv(torch.nn.Module):
         self.seqlen = seqlen
         self.dtype = dtype
         self.use_32_butterfly=use_32_butterfly
-        if seqlen in [256, 1024]:
-            N = seqlen
-            sqrt_N = int(math.sqrt(seqlen))
-            self.N = N
-            self.sqrt_N = sqrt_N
-            f_sqrt_N_fft = torch.view_as_real(fft_matrix(sqrt_N)).to(dtype)
-            f_sqrt_N_ifft = torch.view_as_real(ifft_matrix(sqrt_N)).to(dtype)
+        self._select_strategy()
 
-            twiddle_factors_fft = torch.view_as_real(compute_twiddle_factors_fft(sqrt_N, sqrt_N) / N).to(dtype)
-            twiddle_factors_ifft = torch.view_as_real(compute_twiddle_factors_ifft(sqrt_N, sqrt_N)).to(dtype)
+    def _select_strategy(self):
+        strategies = {
+            (256, 1024): Strategy256_1024,
+            (512, 2048): Strategy512_2048,
+            (4096,): Strategy4096,
+            #TODO: add the other configs
+        }
 
-            self.register_buffer('f_sqrt_N_fft', f_sqrt_N_fft)
-            self.register_buffer('f_sqrt_N_ifft', f_sqrt_N_ifft)
-            self.register_buffer('twiddle_factors_fft', twiddle_factors_fft)
-            self.register_buffer('twiddle_factors_ifft', twiddle_factors_ifft)
-        elif seqlen in [512, 2048]:
-            N = seqlen // 2
-            sqrt_N = int(math.sqrt(seqlen // 2))
-            self.N = seqlen // 2
-            self.sqrt_N = sqrt_N
-            f_sqrt_N_fft = torch.view_as_real(fft_matrix(sqrt_N)).to(dtype)
-            f_sqrt_N_ifft = torch.view_as_real(ifft_matrix(sqrt_N)).to(dtype)
+        for seqlen_values, strategy_class in strategies.items():
+            if self.seqlen in seqlen_values:
+                strategy = strategy_class(self, self.dtype, self.use_32_butterfly)
+                strategy.initialize()
+                return
 
-            twiddle_factors_fft = torch.view_as_real(compute_twiddle_factors_fft(sqrt_N, sqrt_N) / N).to(dtype)
-            twiddle_factors_ifft = torch.view_as_real(compute_twiddle_factors_ifft(sqrt_N, sqrt_N)).to(dtype)
-
-            twid = torch.view_as_real(torch.exp(-2j * torch.pi * torch.arange(seqlen // 2) / seqlen)).to(dtype)
-
-            self.register_buffer('f_sqrt_N_fft', f_sqrt_N_fft)
-            self.register_buffer('f_sqrt_N_ifft', f_sqrt_N_ifft)
-            self.register_buffer('twiddle_factors_fft', twiddle_factors_fft)
-            self.register_buffer('twiddle_factors_ifft', twiddle_factors_ifft)
-            self.register_buffer('twid', twid)
-        elif seqlen == 4096:
-            N = seqlen
-            sqrt_N = 16
-            sqrt_N_256 = 256
-            self.N = N
-            self.sqrt_N = sqrt_N
-            self.sqrt_N_256 = sqrt_N_256
-            f_sqrt_N_fft = torch.view_as_real(fft_matrix(sqrt_N)).to(dtype)
-            f_sqrt_N_ifft = torch.view_as_real(ifft_matrix(sqrt_N)).to(dtype)
-
-            twiddle_factors_fft_16_16 = torch.view_as_real(compute_twiddle_factors_fft(sqrt_N, sqrt_N)).to(dtype)
-            twiddle_factors_ifft_16_16 = torch.view_as_real(compute_twiddle_factors_ifft(sqrt_N, sqrt_N)).to(dtype)
-            twiddle_factors_fft_16_256 = torch.view_as_real(compute_twiddle_factors_fft(sqrt_N, sqrt_N_256) / N).to(dtype)
-            twiddle_factors_ifft_16_256 = torch.view_as_real(compute_twiddle_factors_ifft(sqrt_N, sqrt_N_256)).to(dtype)
-
-            self.register_buffer('f_sqrt_N_fft', f_sqrt_N_fft)
-            self.register_buffer('f_sqrt_N_ifft', f_sqrt_N_ifft)
-            self.register_buffer('twiddle_factors_fft_16_16', twiddle_factors_fft_16_16)
-            self.register_buffer('twiddle_factors_ifft_16_16', twiddle_factors_ifft_16_16)
-            self.register_buffer('twiddle_factors_fft_16_256', twiddle_factors_fft_16_256)
-            self.register_buffer('twiddle_factors_ifft_16_256', twiddle_factors_ifft_16_256)
-        elif seqlen == 8192:
-            N = seqlen
-            N1 = 32
-            N2 = 16
-            self.N = N
-            self.N1 = N1
-            self.N2 = N2
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-            f_16_fft = torch.view_as_real(fft_matrix(16)).to(dtype)
-            f_16_ifft = torch.view_as_real(ifft_matrix(16)).to(dtype)
-
-            twiddle_factors_fft_16_16 = torch.view_as_real(compute_twiddle_factors_fft(16, 16)).to(dtype)
-            twiddle_factors_ifft_16_16 = torch.view_as_real(compute_twiddle_factors_ifft(16, 16)).to(dtype)
-            twiddle_factors_fft_32_256 = torch.view_as_real(compute_twiddle_factors_fft(32, 256) / N).to(dtype)
-            twiddle_factors_ifft_32_256 = torch.view_as_real(compute_twiddle_factors_ifft(32, 256)).to(dtype)
-
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('f_16_fft', f_16_fft)
-            self.register_buffer('f_16_ifft', f_16_ifft)
-            self.register_buffer('twiddle_factors_fft_16_16', twiddle_factors_fft_16_16)
-            self.register_buffer('twiddle_factors_ifft_16_16', twiddle_factors_ifft_16_16)
-            self.register_buffer('twiddle_factors_fft_32_256', twiddle_factors_fft_32_256)
-            self.register_buffer('twiddle_factors_ifft_32_256', twiddle_factors_ifft_32_256)
-        elif seqlen == 16384:
-            N = seqlen
-            N1 = 16
-            N2 = 32
-            self.N = N
-            self.N1 = N1
-            self.N2 = N2
-            f_16_fft = torch.view_as_real(fft_matrix(16)).to(dtype)
-            f_16_ifft = torch.view_as_real(ifft_matrix(16)).to(dtype)
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-
-            twiddle_factors_fft_32_32 = torch.view_as_real(compute_twiddle_factors_fft(32, 32)).to(dtype)
-            twiddle_factors_ifft_32_32 = torch.view_as_real(compute_twiddle_factors_ifft(32, 32)).to(dtype)
-            twiddle_factors_fft_16_1K = torch.view_as_real(compute_twiddle_factors_fft(16, 1024) / N).to(dtype)
-            twiddle_factors_ifft_16_1K = torch.view_as_real(compute_twiddle_factors_ifft(16, 1024)).to(dtype)
-
-            self.register_buffer('f_16_fft', f_16_fft)
-            self.register_buffer('f_16_ifft', f_16_ifft)
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('twiddle_factors_fft_32_32', twiddle_factors_fft_32_32)
-            self.register_buffer('twiddle_factors_ifft_32_32', twiddle_factors_ifft_32_32)
-            self.register_buffer('twiddle_factors_fft_16_1K', twiddle_factors_fft_16_1K)
-            self.register_buffer('twiddle_factors_ifft_16_1K', twiddle_factors_ifft_16_1K)
-        elif seqlen == 32768:
-            N = seqlen
-            N1 = 32
-            N2 = 32
-            self.N = N
-            self.N1 = N1
-            self.N2 = N2
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-
-            twiddle_factors_fft_32_32 = torch.view_as_real(compute_twiddle_factors_fft(32, 32)).to(dtype)
-            twiddle_factors_ifft_32_32 = torch.view_as_real(compute_twiddle_factors_ifft(32, 32)).to(dtype)
-            twiddle_factors_fft_32_1K = torch.view_as_real(compute_twiddle_factors_fft(32, 1024) / N).to(dtype)
-            twiddle_factors_ifft_32_1K = torch.view_as_real(compute_twiddle_factors_ifft(32, 1024)).to(dtype)
-
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('twiddle_factors_fft_32_32', twiddle_factors_fft_32_32)
-            self.register_buffer('twiddle_factors_ifft_32_32', twiddle_factors_ifft_32_32)
-            self.register_buffer('twiddle_factors_fft_32_1K', twiddle_factors_fft_32_1K)
-            self.register_buffer('twiddle_factors_ifft_32_1K', twiddle_factors_ifft_32_1K)
-        elif seqlen == 16 * 4096: #65K
-            N = seqlen
-            self.N = N
-
-            f_16_fft = torch.view_as_real(fft_matrix(16)).to(dtype)
-            f_16_ifft = torch.view_as_real(ifft_matrix(16)).to(dtype)
-
-            if dtype == torch.bfloat16:
-                f_16_fft_real = fft_matrix(16).real.to(dtype)
-                f_16_ifft_real = ifft_matrix(16).real.to(dtype)
-                f_16_fft_imag = fft_matrix(16).imag.to(dtype)
-                f_16_ifft_imag = ifft_matrix(16).imag.to(dtype)
-
-                self.register_buffer('f_16_fft_real', f_16_fft_real)
-                self.register_buffer('f_16_ifft_real', f_16_ifft_real)
-                self.register_buffer('f_16_fft_imag', f_16_fft_imag)
-                self.register_buffer('f_16_ifft_imag', f_16_ifft_imag)
-
-            self.register_buffer('f_16_fft', f_16_fft)
-            self.register_buffer('f_16_ifft', f_16_ifft)
-
-            twiddle_factors_fft_16_16 = torch.view_as_real(compute_twiddle_factors_fft(16, 16)).to(dtype)
-            twiddle_factors_ifft_16_16 = torch.view_as_real(compute_twiddle_factors_ifft(16, 16)).to(dtype)
-            twiddle_factors_fft_16_256 = torch.view_as_real(compute_twiddle_factors_fft(16, 256) / 4096).to(dtype)
-            twiddle_factors_ifft_16_256 = torch.view_as_real(compute_twiddle_factors_ifft(16, 256)).to(dtype)
-
-            twiddle_factors_fft = compute_twiddle_factors_fft(16, 4096) / 16
-            twiddle_factors_ifft = compute_twiddle_factors_ifft(16, 4096)
-
-            self.register_buffer('twiddle_factors_fft_16_16', twiddle_factors_fft_16_16)
-            self.register_buffer('twiddle_factors_ifft_16_16', twiddle_factors_ifft_16_16)
-            self.register_buffer('twiddle_factors_fft_16_256', twiddle_factors_fft_16_256)
-            self.register_buffer('twiddle_factors_ifft_16_256', twiddle_factors_ifft_16_256)
-            self.register_buffer('twiddle_factors_fft_real', twiddle_factors_fft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_real', twiddle_factors_ifft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_fft_imag', twiddle_factors_fft.imag.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_imag', twiddle_factors_ifft.imag.to(dtype).contiguous())
-        elif seqlen == 16 * 8192: #131K
-            N = seqlen
-            self.N = N
-
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-            f_16_fft = torch.view_as_real(fft_matrix(16)).to(dtype)
-            f_16_ifft = torch.view_as_real(ifft_matrix(16)).to(dtype)
-
-            if self.use_32_butterfly:
-                if dtype == torch.bfloat16:
-                    f_32_fft_real = fft_matrix(32).real.to(dtype)
-                    f_32_ifft_real = ifft_matrix(32).real.to(dtype)
-                    f_32_fft_imag = fft_matrix(32).imag.to(dtype)
-                    f_32_ifft_imag = ifft_matrix(32).imag.to(dtype)
-
-                    self.register_buffer('f_32_fft_real', f_32_fft_real)
-                    self.register_buffer('f_32_ifft_real', f_32_ifft_real)
-                    self.register_buffer('f_32_fft_imag', f_32_fft_imag)
-                    self.register_buffer('f_32_ifft_imag', f_32_ifft_imag)
-            else:
-                if dtype == torch.bfloat16:
-                    f_16_fft_real = fft_matrix(16).real.to(dtype)
-                    f_16_ifft_real = ifft_matrix(16).real.to(dtype)
-                    f_16_fft_imag = fft_matrix(16).imag.to(dtype)
-                    f_16_ifft_imag = ifft_matrix(16).imag.to(dtype)
-
-                    self.register_buffer('f_16_fft_real', f_16_fft_real)
-                    self.register_buffer('f_16_ifft_real', f_16_ifft_real)
-                    self.register_buffer('f_16_fft_imag', f_16_fft_imag)
-                    self.register_buffer('f_16_ifft_imag', f_16_ifft_imag)
-
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('f_16_fft', f_16_fft)
-            self.register_buffer('f_16_ifft', f_16_ifft)
-
-            if self.use_32_butterfly:
-                twiddle_factors_fft_16_16 = torch.view_as_real(compute_twiddle_factors_fft(16, 16)).to(dtype)
-                twiddle_factors_ifft_16_16 = torch.view_as_real(compute_twiddle_factors_ifft(16, 16)).to(dtype)
-                twiddle_factors_fft_16_256 = torch.view_as_real(compute_twiddle_factors_fft(16, 256) / 4096).to(dtype)
-                twiddle_factors_ifft_16_256 = torch.view_as_real(compute_twiddle_factors_ifft(16, 256)).to(dtype)
-
-                twiddle_factors_fft = compute_twiddle_factors_fft(32, 4096) / 32
-                twiddle_factors_ifft = compute_twiddle_factors_ifft(32, 4096)
-            else:
-                twiddle_factors_fft_16_16 = torch.view_as_real(compute_twiddle_factors_fft(16, 16)).to(dtype)
-                twiddle_factors_ifft_16_16 = torch.view_as_real(compute_twiddle_factors_ifft(16, 16)).to(dtype)
-                twiddle_factors_fft_32_256 = torch.view_as_real(compute_twiddle_factors_fft(32, 256) / 8192).to(dtype)
-                twiddle_factors_ifft_32_256 = torch.view_as_real(compute_twiddle_factors_ifft(32, 256)).to(dtype)
-
-                twiddle_factors_fft = compute_twiddle_factors_fft(16, 8192) / 16
-                twiddle_factors_ifft = compute_twiddle_factors_ifft(16, 8192)
-
-            if self.use_32_butterfly:
-                self.register_buffer('twiddle_factors_fft_16_16', twiddle_factors_fft_16_16)
-                self.register_buffer('twiddle_factors_ifft_16_16', twiddle_factors_ifft_16_16)
-                self.register_buffer('twiddle_factors_fft_16_256', twiddle_factors_fft_16_256)
-                self.register_buffer('twiddle_factors_ifft_16_256', twiddle_factors_ifft_16_256)
-            else:
-                self.register_buffer('twiddle_factors_fft_16_16', twiddle_factors_fft_16_16)
-                self.register_buffer('twiddle_factors_ifft_16_16', twiddle_factors_ifft_16_16)
-                self.register_buffer('twiddle_factors_fft_32_256', twiddle_factors_fft_32_256)
-                self.register_buffer('twiddle_factors_ifft_32_256', twiddle_factors_ifft_32_256)
-            self.register_buffer('twiddle_factors_fft_real', twiddle_factors_fft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_real', twiddle_factors_ifft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_fft_imag', twiddle_factors_fft.imag.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_imag', twiddle_factors_ifft.imag.to(dtype).contiguous())
-        elif seqlen == 16 * 16384: #262K
-            N = seqlen
-            self.N = N
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-            f_16_fft = torch.view_as_real(fft_matrix(16)).to(dtype)
-            f_16_ifft = torch.view_as_real(ifft_matrix(16)).to(dtype)
-
-            if self.use_32_butterfly:
-                if dtype == torch.bfloat16:
-                    f_32_fft_real = fft_matrix(32).real.to(dtype)
-                    f_32_ifft_real = ifft_matrix(32).real.to(dtype)
-                    f_32_fft_imag = fft_matrix(32).imag.to(dtype)
-                    f_32_ifft_imag = ifft_matrix(32).imag.to(dtype)
-
-                    self.register_buffer('f_32_fft_real', f_32_fft_real)
-                    self.register_buffer('f_32_ifft_real', f_32_ifft_real)
-                    self.register_buffer('f_32_fft_imag', f_32_fft_imag)
-                    self.register_buffer('f_32_ifft_imag', f_32_ifft_imag)
-            else:
-                if dtype == torch.bfloat16:
-                    f_16_fft_real = fft_matrix(16).real.to(dtype)
-                    f_16_ifft_real = ifft_matrix(16).real.to(dtype)
-                    f_16_fft_imag = fft_matrix(16).imag.to(dtype)
-                    f_16_ifft_imag = ifft_matrix(16).imag.to(dtype)
-
-                    self.register_buffer('f_16_fft_real', f_16_fft_real)
-                    self.register_buffer('f_16_ifft_real', f_16_ifft_real)
-                    self.register_buffer('f_16_fft_imag', f_16_fft_imag)
-                    self.register_buffer('f_16_ifft_imag', f_16_ifft_imag)
-
-            if self.use_32_butterfly:
-                twiddle_factors_fft_16_16 = torch.view_as_real(compute_twiddle_factors_fft(16, 16)).to(dtype)
-                twiddle_factors_ifft_16_16 = torch.view_as_real(compute_twiddle_factors_ifft(16, 16)).to(dtype)
-                twiddle_factors_fft_32_256 = torch.view_as_real(compute_twiddle_factors_fft(32, 256) / 8192).to(dtype)
-                twiddle_factors_ifft_32_256 = torch.view_as_real(compute_twiddle_factors_ifft(32, 256)).to(dtype)
-
-                twiddle_factors_fft = compute_twiddle_factors_fft(32, 8192) / 32
-                twiddle_factors_ifft = compute_twiddle_factors_ifft(32, 8192)
-            else:
-                twiddle_factors_fft_32_32 = torch.view_as_real(compute_twiddle_factors_fft(32, 32)).to(dtype)
-                twiddle_factors_ifft_32_32 = torch.view_as_real(compute_twiddle_factors_ifft(32, 32)).to(dtype)
-                twiddle_factors_fft_16_1K = torch.view_as_real(compute_twiddle_factors_fft(16, 1024) / 16384).to(dtype)
-                twiddle_factors_ifft_16_1K = torch.view_as_real(compute_twiddle_factors_ifft(16, 1024)).to(dtype)
-
-                twiddle_factors_fft = compute_twiddle_factors_fft(16, 16384) / 16
-                twiddle_factors_ifft = compute_twiddle_factors_ifft(16, 16384)
-
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('f_16_fft', f_16_fft)
-            self.register_buffer('f_16_ifft', f_16_ifft)
-            if self.use_32_butterfly:
-                self.register_buffer('twiddle_factors_fft_16_16', twiddle_factors_fft_16_16)
-                self.register_buffer('twiddle_factors_ifft_16_16', twiddle_factors_ifft_16_16)
-                self.register_buffer('twiddle_factors_fft_32_256', twiddle_factors_fft_32_256)
-                self.register_buffer('twiddle_factors_ifft_32_256', twiddle_factors_ifft_32_256)
-            else:
-                self.register_buffer('twiddle_factors_fft_32_32', twiddle_factors_fft_32_32)
-                self.register_buffer('twiddle_factors_ifft_32_32', twiddle_factors_ifft_32_32)
-                self.register_buffer('twiddle_factors_fft_16_1K', twiddle_factors_fft_16_1K)
-                self.register_buffer('twiddle_factors_ifft_16_1K', twiddle_factors_ifft_16_1K)
-            self.register_buffer('twiddle_factors_fft_real', twiddle_factors_fft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_real', twiddle_factors_ifft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_fft_imag', twiddle_factors_fft.imag.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_imag', twiddle_factors_ifft.imag.to(dtype).contiguous())
-        elif seqlen == 16 * 32768: #524K
-            N = seqlen
-            self.N = N
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-            f_16_fft = torch.view_as_real(fft_matrix(16)).to(dtype)
-            f_16_ifft = torch.view_as_real(ifft_matrix(16)).to(dtype)
-
-            if self.use_32_butterfly:
-                if dtype == torch.bfloat16:
-                    f_32_fft_real = fft_matrix(32).real.to(dtype)
-                    f_32_ifft_real = ifft_matrix(32).real.to(dtype)
-                    f_32_fft_imag = fft_matrix(32).imag.to(dtype)
-                    f_32_ifft_imag = ifft_matrix(32).imag.to(dtype)
-
-                    self.register_buffer('f_32_fft_real', f_32_fft_real)
-                    self.register_buffer('f_32_ifft_real', f_32_ifft_real)
-                    self.register_buffer('f_32_fft_imag', f_32_fft_imag)
-                    self.register_buffer('f_32_ifft_imag', f_32_ifft_imag)
-            else:
-                if dtype == torch.bfloat16:
-                    f_16_fft_real = fft_matrix(16).real.to(dtype)
-                    f_16_ifft_real = ifft_matrix(16).real.to(dtype)
-                    f_16_fft_imag = fft_matrix(16).imag.to(dtype)
-                    f_16_ifft_imag = ifft_matrix(16).imag.to(dtype)
-
-                    self.register_buffer('f_16_fft_real', f_16_fft_real)
-                    self.register_buffer('f_16_ifft_real', f_16_ifft_real)
-                    self.register_buffer('f_16_fft_imag', f_16_fft_imag)
-                    self.register_buffer('f_16_ifft_imag', f_16_ifft_imag)
-            
-            twiddle_factors_fft_32_32 = torch.view_as_real(compute_twiddle_factors_fft(32, 32)).to(dtype)
-            twiddle_factors_ifft_32_32 = torch.view_as_real(compute_twiddle_factors_ifft(32, 32)).to(dtype)
-            
-            if self.use_32_butterfly:
-                twiddle_factors_fft_16_1K = torch.view_as_real(compute_twiddle_factors_fft(16, 1024) / 16384).to(dtype)
-                twiddle_factors_ifft_16_1K = torch.view_as_real(compute_twiddle_factors_ifft(16, 1024)).to(dtype)
-
-                twiddle_factors_fft = compute_twiddle_factors_fft(32, 16384) / 32
-                twiddle_factors_ifft = compute_twiddle_factors_ifft(32, 16384)
-            else:
-                twiddle_factors_fft_32_1K = torch.view_as_real(compute_twiddle_factors_fft(32, 1024) / 32768).to(dtype)
-                twiddle_factors_ifft_32_1K = torch.view_as_real(compute_twiddle_factors_ifft(32, 1024)).to(dtype)
-
-                twiddle_factors_fft = compute_twiddle_factors_fft(16, 32768) / 16
-                twiddle_factors_ifft = compute_twiddle_factors_ifft(16, 32768)
-
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('f_16_fft', f_16_fft)
-            self.register_buffer('f_16_ifft', f_16_ifft)
-            self.register_buffer('twiddle_factors_fft_32_32', twiddle_factors_fft_32_32)
-            self.register_buffer('twiddle_factors_ifft_32_32', twiddle_factors_ifft_32_32)
-            if self.use_32_butterfly:
-                self.register_buffer('twiddle_factors_fft_16_1K', twiddle_factors_fft_16_1K)
-                self.register_buffer('twiddle_factors_ifft_16_1K', twiddle_factors_ifft_16_1K)
-            else:
-                self.register_buffer('twiddle_factors_fft_32_1K', twiddle_factors_fft_32_1K)
-                self.register_buffer('twiddle_factors_ifft_32_1K', twiddle_factors_ifft_32_1K)
-            self.register_buffer('twiddle_factors_fft_real', twiddle_factors_fft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_real', twiddle_factors_ifft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_fft_imag', twiddle_factors_fft.imag.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_imag', twiddle_factors_ifft.imag.to(dtype).contiguous())
-        elif seqlen == 32 * 32768: #1M
-            N = seqlen
-            self.N = N
-
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            if dtype == torch.bfloat16:
-                f_32_fft_real = fft_matrix(32).real.to(dtype)
-                f_32_ifft_real = ifft_matrix(32).real.to(dtype)
-                f_32_fft_imag = fft_matrix(32).imag.to(dtype)
-                f_32_ifft_imag = ifft_matrix(32).imag.to(dtype)
-
-                self.register_buffer('f_32_fft_real', f_32_fft_real)
-                self.register_buffer('f_32_ifft_real', f_32_ifft_real)
-                self.register_buffer('f_32_fft_imag', f_32_fft_imag)
-                self.register_buffer('f_32_ifft_imag', f_32_ifft_imag)
-
-            twiddle_factors_fft_32_32 = torch.view_as_real(compute_twiddle_factors_fft(32, 32)).to(dtype)
-            twiddle_factors_ifft_32_32 = torch.view_as_real(compute_twiddle_factors_ifft(32, 32)).to(dtype)
-            twiddle_factors_fft_32_1K = torch.view_as_real(compute_twiddle_factors_fft(32, 1024) / 32768).to(dtype)
-            twiddle_factors_ifft_32_1K = torch.view_as_real(compute_twiddle_factors_ifft(32, 1024)).to(dtype)
-
-            twiddle_factors_fft = compute_twiddle_factors_fft(32, 32768) / 32
-            twiddle_factors_ifft = compute_twiddle_factors_ifft(32, 32768)
-
-            self.register_buffer('twiddle_factors_fft_32_32', twiddle_factors_fft_32_32)
-            self.register_buffer('twiddle_factors_ifft_32_32', twiddle_factors_ifft_32_32)
-            self.register_buffer('twiddle_factors_fft_32_1K', twiddle_factors_fft_32_1K)
-            self.register_buffer('twiddle_factors_ifft_32_1K', twiddle_factors_ifft_32_1K)
-            self.register_buffer('twiddle_factors_fft_real', twiddle_factors_fft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_real', twiddle_factors_ifft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_fft_imag', twiddle_factors_fft.imag.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_imag', twiddle_factors_ifft.imag.to(dtype).contiguous())
-        elif seqlen == 64 * 32768: #2M
-            N = seqlen
-            self.N = N
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-            f_64_fft = torch.view_as_real(fft_matrix(64)).to(dtype)
-            f_64_ifft = torch.view_as_real(ifft_matrix(64)).to(dtype)
-
-            if dtype == torch.bfloat16:
-                f_64_fft_real = fft_matrix(64).real.to(dtype)
-                f_64_ifft_real = ifft_matrix(64).real.to(dtype)
-                f_64_fft_imag = fft_matrix(64).imag.to(dtype)
-                f_64_ifft_imag = ifft_matrix(64).imag.to(dtype)
-
-                self.register_buffer('f_64_fft_real', f_64_fft_real)
-                self.register_buffer('f_64_ifft_real', f_64_ifft_real)
-                self.register_buffer('f_64_fft_imag', f_64_fft_imag)
-                self.register_buffer('f_64_ifft_imag', f_64_ifft_imag)
-
-            twiddle_factors_fft_32_32 = torch.view_as_real(compute_twiddle_factors_fft(32, 32)).to(dtype)
-            twiddle_factors_ifft_32_32 = torch.view_as_real(compute_twiddle_factors_ifft(32, 32)).to(dtype)
-            twiddle_factors_fft_32_1K = torch.view_as_real(compute_twiddle_factors_fft(32, 1024) / 32768).to(dtype)
-            twiddle_factors_ifft_32_1K = torch.view_as_real(compute_twiddle_factors_ifft(32, 1024)).to(dtype)
-
-            twiddle_factors_fft = compute_twiddle_factors_fft(64, 32768) / 64
-            twiddle_factors_ifft = compute_twiddle_factors_ifft(64, 32768)
-
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('f_64_fft', f_64_fft)
-            self.register_buffer('f_64_ifft', f_64_ifft)
-            self.register_buffer('twiddle_factors_fft_32_32', twiddle_factors_fft_32_32)
-            self.register_buffer('twiddle_factors_ifft_32_32', twiddle_factors_ifft_32_32)
-            self.register_buffer('twiddle_factors_fft_32_1K', twiddle_factors_fft_32_1K)
-            self.register_buffer('twiddle_factors_ifft_32_1K', twiddle_factors_ifft_32_1K)
-            self.register_buffer('twiddle_factors_fft_real', twiddle_factors_fft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_real', twiddle_factors_ifft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_fft_imag', twiddle_factors_fft.imag.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_imag', twiddle_factors_ifft.imag.to(dtype).contiguous())
-        elif seqlen == 128 * 32768: #4M
-            N = seqlen
-            self.N = N
-            f_32_fft = torch.view_as_real(fft_matrix(32)).to(dtype)
-            f_32_ifft = torch.view_as_real(ifft_matrix(32)).to(dtype)
-            f_128_fft = torch.view_as_real(fft_matrix(128)).to(dtype)
-            f_128_ifft = torch.view_as_real(ifft_matrix(128)).to(dtype)
-
-            if dtype == torch.bfloat16:
-                f_128_fft_real = fft_matrix(128).real.to(dtype)
-                f_128_ifft_real = ifft_matrix(128).real.to(dtype)
-                f_128_fft_imag = fft_matrix(128).imag.to(dtype)
-                f_128_ifft_imag = ifft_matrix(128).imag.to(dtype)
-
-                self.register_buffer('f_128_fft_real', f_128_fft_real)
-                self.register_buffer('f_128_ifft_real', f_128_ifft_real)
-                self.register_buffer('f_128_fft_imag', f_128_fft_imag)
-                self.register_buffer('f_128_ifft_imag', f_128_ifft_imag)
-
-            twiddle_factors_fft_32_32 = torch.view_as_real(compute_twiddle_factors_fft(32, 32)).to(dtype)
-            twiddle_factors_ifft_32_32 = torch.view_as_real(compute_twiddle_factors_ifft(32, 32)).to(dtype)
-            twiddle_factors_fft_32_1K = torch.view_as_real(compute_twiddle_factors_fft(32, 1024) / 32768).to(dtype)
-            twiddle_factors_ifft_32_1K = torch.view_as_real(compute_twiddle_factors_ifft(32, 1024)).to(dtype)
-
-            twiddle_factors_fft = compute_twiddle_factors_fft(128, 32768) / 128
-            twiddle_factors_ifft = compute_twiddle_factors_ifft(128, 32768)
-
-            self.register_buffer('f_32_fft', f_32_fft)
-            self.register_buffer('f_32_ifft', f_32_ifft)
-            self.register_buffer('f_128_fft', f_128_fft)
-            self.register_buffer('f_128_ifft', f_128_ifft)
-            self.register_buffer('twiddle_factors_fft_32_32', twiddle_factors_fft_32_32)
-            self.register_buffer('twiddle_factors_ifft_32_32', twiddle_factors_ifft_32_32)
-            self.register_buffer('twiddle_factors_fft_32_1K', twiddle_factors_fft_32_1K)
-            self.register_buffer('twiddle_factors_ifft_32_1K', twiddle_factors_ifft_32_1K)
-            self.register_buffer('twiddle_factors_fft_real', twiddle_factors_fft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_real', twiddle_factors_ifft.real.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_fft_imag', twiddle_factors_fft.imag.to(dtype).contiguous())
-            self.register_buffer('twiddle_factors_ifft_imag', twiddle_factors_ifft.imag.to(dtype).contiguous())
-        else:
-            raise NotImplementedError(f'seqlen {seqlen} not supported')
+        raise NotImplementedError(f'seqlen {self.seqlen} not supported')
     
     def forward(self, u, k, pregate=None, postgate=None):
-        # orig_dtype = u.dtype
-        # if (u.dtype != self.dtype):
-        #     u = u.to(self.dtype).contiguous()
         if pregate is not None or postgate is not None:
             assert pregate is not None and postgate is not None
             return GatedFlashFFTConvFunc.apply(u, k, self, pregate, postgate)
         return FlashFFTConvFunc.apply(u, k, self)
 
-
 class FlashFFTConvFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, u, k, fftconv_data):
-        # assert(u.dtype == fftconv_data.dtype)
 
         B, H, L = u.shape
 
@@ -590,11 +81,17 @@ class FlashFFTConvFunc(torch.autograd.Function):
                 ctx.save_for_backward(u, k_f_permuted)
 
             return monarch_conv_forward(
-                u, k_f_permuted,
-                fftconv_data.f_sqrt_N_fft, fftconv_data.twiddle_factors_fft,
-                fftconv_data.f_sqrt_N_ifft, fftconv_data.twiddle_factors_ifft,
-                None, None,
-                N, L, sqrt_N
+                u, 
+                k_f_permuted,
+                fftconv_data.f_sqrt_N_fft, 
+                fftconv_data.twiddle_factors_fft,
+                fftconv_data.f_sqrt_N_ifft, 
+                fftconv_data.twiddle_factors_ifft,
+                None, 
+                None,
+                N, 
+                L, 
+                sqrt_N
             )
         elif fftconv_data.seqlen in [512, 2048]:
             N = fftconv_data.N

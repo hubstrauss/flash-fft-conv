@@ -8,4 +8,5 @@ if __name__ == "__main__":
           author='Dan Fu, Hermann Kumbong',
           author_email='danfu@cs.stanford.edu',
           license='Apache 2.0',
-          packages=['flashfftconv'])
+          packages=['flashfftconv'], 
+          install_requires=['einops', 'pytest'])
